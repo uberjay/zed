@@ -12,7 +12,7 @@ use anyhow::{Context as _, Result};
 use async_tungstenite::tungstenite::{
     Message,
     handshake::server::{ErrorResponse, Request, Response},
-    http,
+    http::{self, HeaderValue, header},
 };
 use futures::{AsyncRead, AsyncWrite, StreamExt as _};
 use serde::Serialize;
@@ -27,6 +27,11 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The HTTP header the CLI must send, carrying the token from the lock file.
 pub const AUTH_HEADER: &str = "x-claude-code-ide-authorization";
+
+/// The WebSocket subprotocol MCP-over-WebSocket clients request. The CLI offers
+/// it during the handshake and silently abandons a connection whose `101`
+/// response doesn't select it, so we must echo it back.
+pub const MCP_SUBPROTOCOL: &str = "mcp";
 
 /// JSON-RPC 2.0 standard error codes (see the spec, section 5.1).
 pub mod error_codes {
@@ -107,18 +112,30 @@ where
     // The handshake callback runs during the HTTP upgrade. We reject the
     // connection unless it presents the exact token we wrote into the lock file,
     // so only the CLI that read our lock file (same user) can connect.
-    let authorize = move |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let presented = request.headers().get(AUTH_HEADER).map(|value| value.as_bytes());
-        if presented == Some(auth_token.as_bytes()) {
+    let authorize =
+        move |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+            let presented = request.headers().get(AUTH_HEADER).map(|value| value.as_bytes());
+            if presented != Some(auth_token.as_bytes()) {
+                let denied = http::Response::builder()
+                    .status(http::StatusCode::UNAUTHORIZED)
+                    .body(Some("invalid or missing authorization token".to_string()))
+                    .expect("static unauthorized response is valid");
+                return Err(denied);
+            }
+
+            let offered = request
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok());
+            if offers_mcp_subprotocol(offered) {
+                response.headers_mut().insert(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_static(MCP_SUBPROTOCOL),
+                );
+            }
+
             Ok(response)
-        } else {
-            let denied = http::Response::builder()
-                .status(http::StatusCode::UNAUTHORIZED)
-                .body(Some("invalid or missing authorization token".to_string()))
-                .expect("static unauthorized response is valid");
-            Err(denied)
-        }
-    };
+        };
 
     let websocket = async_tungstenite::accept_hdr_async(stream, authorize)
         .await
@@ -146,6 +163,14 @@ where
     }
 
     Ok(())
+}
+
+/// Whether a `Sec-WebSocket-Protocol` header (a comma-separated preference list)
+/// includes the MCP subprotocol.
+fn offers_mcp_subprotocol(header_value: Option<&str>) -> bool {
+    header_value.is_some_and(|value| {
+        value.split(',').any(|protocol| protocol.trim().eq_ignore_ascii_case(MCP_SUBPROTOCOL))
+    })
 }
 
 /// Routes a single incoming JSON-RPC message. Returns `Some(json)` to send back
@@ -318,6 +343,71 @@ mod tests {
             &MockDispatcher,
         ));
         assert!(result.is_none());
+    }
+
+    /// The CLI offers the `mcp` subprotocol and abandons the connection unless
+    /// the handshake response selects it, so exercise a real handshake.
+    #[test]
+    fn handshake_selects_the_mcp_subprotocol() {
+        use async_tungstenite::tungstenite::handshake::client::generate_key;
+
+        block_on(async {
+            let (listener, port) = bind().await.expect("binding listener");
+            let serve = async {
+                let (stream, _) = listener.accept().await.expect("accepting connection");
+                serve_connection(stream, "the-token".to_string(), MockDispatcher)
+                    .await
+                    .expect("serving connection");
+            };
+
+            let exercise = async {
+                let stream = smol::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("connecting to listener");
+                let request = http::Request::builder()
+                    .uri(format!("ws://127.0.0.1:{port}/"))
+                    .header(header::HOST, format!("127.0.0.1:{port}"))
+                    .header(header::CONNECTION, "Upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header(header::SEC_WEBSOCKET_VERSION, "13")
+                    .header(header::SEC_WEBSOCKET_KEY, generate_key())
+                    .header(header::SEC_WEBSOCKET_PROTOCOL, MCP_SUBPROTOCOL)
+                    .header(AUTH_HEADER, "the-token")
+                    .body(())
+                    .expect("building handshake request");
+
+                let (mut websocket, response) = async_tungstenite::client_async(request, stream)
+                    .await
+                    .expect("completing handshake");
+                assert_eq!(
+                    response.headers().get(header::SEC_WEBSOCKET_PROTOCOL).map(|v| v.as_bytes()),
+                    Some(MCP_SUBPROTOCOL.as_bytes()),
+                );
+
+                websocket
+                    .send(Message::Text(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.into(),
+                    ))
+                    .await
+                    .expect("sending initialize");
+                let reply = websocket.next().await.expect("a reply").expect("a text frame");
+                let reply: Value =
+                    serde_json::from_str(reply.to_text().expect("text frame")).expect("valid json");
+                assert_eq!(reply["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+
+                websocket.close(None).await.expect("closing the connection");
+            };
+
+            futures::future::join(serve, exercise).await;
+        });
+    }
+
+    #[test]
+    fn mcp_subprotocol_is_recognized_within_a_preference_list() {
+        assert!(offers_mcp_subprotocol(Some("mcp")));
+        assert!(offers_mcp_subprotocol(Some("chat, MCP")));
+        assert!(!offers_mcp_subprotocol(Some("mcp-v2")));
+        assert!(!offers_mcp_subprotocol(None));
     }
 
     #[test]

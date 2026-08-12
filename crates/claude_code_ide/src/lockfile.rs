@@ -20,6 +20,12 @@ struct LockFileContents {
     workspace_folders: Vec<String>,
     ide_name: &'static str,
     transport: &'static str,
+    // The CLI decides between `ws://host:port` and `http://host:port/sse` solely
+    // from this flag; it never looks at `transport`. Omitting it makes the CLI
+    // dial our WebSocket listener as if it were an SSE endpoint, which fails.
+    // `camelCase` would render this `useWebsocket`, which the CLI ignores.
+    #[serde(rename = "useWebSocket")]
+    use_websocket: bool,
     auth_token: String,
 }
 
@@ -60,6 +66,7 @@ pub fn create(port: u16, auth_token: &str, workspace_folders: &[PathBuf]) -> Res
             .collect(),
         ide_name: IDE_NAME,
         transport: "ws",
+        use_websocket: true,
         auth_token: auth_token.to_owned(),
     };
     let json = serde_json::to_string(&contents).context("serializing lock file")?;
@@ -116,6 +123,7 @@ mod tests {
             workspace_folders: vec!["/home/user/project".to_string()],
             ide_name: IDE_NAME,
             transport: "ws",
+            use_websocket: true,
             auth_token: "the-token".to_string(),
         };
         let value: serde_json::Value =
@@ -125,6 +133,7 @@ mod tests {
         assert_eq!(value["workspaceFolders"][0], "/home/user/project");
         assert_eq!(value["ideName"], "Zed");
         assert_eq!(value["transport"], "ws");
+        assert_eq!(value["useWebSocket"], true);
         assert_eq!(value["authToken"], "the-token");
     }
 
